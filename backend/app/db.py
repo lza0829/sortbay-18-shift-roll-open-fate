@@ -1,7 +1,11 @@
 from __future__ import annotations
+
+import os
 import sqlite3
 from contextlib import contextmanager
-from app.config import DB_PATH
+from pathlib import Path
+
+from app.config import DB_PATH as DEFAULT_DB_PATH
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS lines (
@@ -15,6 +19,8 @@ CREATE TABLE IF NOT EXISTS shifts (
   name TEXT NOT NULL,
   sealed INTEGER NOT NULL DEFAULT 0,
   sealed_at TEXT,
+  opened_at TEXT,
+  handoff_arch TEXT NOT NULL DEFAULT 'block_uncleared',
   UNIQUE(business_day, name)
 );
 CREATE TABLE IF NOT EXISTS chutes (
@@ -66,6 +72,8 @@ CREATE TABLE IF NOT EXISTS divert_batches (
   code TEXT NOT NULL UNIQUE,
   status TEXT NOT NULL DEFAULT '回流中',
   created_at TEXT NOT NULL,
+  closed_at TEXT,
+  close_note TEXT NOT NULL DEFAULT '',
   note TEXT NOT NULL DEFAULT '',
   FOREIGN KEY(shift_id) REFERENCES shifts(id)
 );
@@ -88,6 +96,16 @@ CREATE TABLE IF NOT EXISTS audit_events (
   created_at TEXT NOT NULL,
   note TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS domain_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  aggregate_type TEXT NOT NULL DEFAULT '班次',
+  aggregate_id INTEGER,
+  event_type TEXT NOT NULL,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_domain_events_opening
+  ON domain_events(aggregate_type, event_type, id);
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -96,17 +114,31 @@ CREATE TABLE IF NOT EXISTS settings (
 
 
 def connect() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    # Read the environment on every connection so test fixtures can redirect a
+    # fully imported application to a temporary database.
+    raw_path = os.environ.get("SORTBAY_DB", str(DEFAULT_DB_PATH))
+    if raw_path != ":memory:":
+        db_path = Path(raw_path)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(raw_path, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 
 @contextmanager
 def db():
+    """Serialize write transactions with BEGIN IMMEDIATE.
+
+    FastAPI's sync endpoints use a thread pool.  Taking the SQLite write lock
+    before reading/writing the opening invariant prevents an opening request
+    and a scan load/route/bag/seal request from interleaving their checks and
+    updates.
+    """
     conn = connect()
     try:
+        conn.execute("BEGIN IMMEDIATE")
         yield conn
         conn.commit()
     except Exception:
@@ -116,9 +148,26 @@ def db():
         conn.close()
 
 
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, declaration: str) -> None:
+    if column not in _columns(conn, table):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+
 def init_db() -> None:
-    with db() as conn:
+    conn = connect()
+    try:
         conn.executescript(SCHEMA)
+        _ensure_column(conn, "shifts", "opened_at", "TEXT")
+        _ensure_column(conn, "shifts", "handoff_arch", "TEXT NOT NULL DEFAULT 'block_uncleared'")
+        _ensure_column(conn, "divert_batches", "closed_at", "TEXT")
+        _ensure_column(conn, "divert_batches", "close_note", "TEXT NOT NULL DEFAULT ''")
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict | None:
